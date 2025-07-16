@@ -322,16 +322,16 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
         ## 新增
-        group_optimization = data.meta_info.get("group_optimization", False)
         endpoint_mask = data.meta_info.get("endpoint_mask", None)
+        # 优先判断 endpoint_mask 是否存在，存在则直接认为是GROUP优化
+        group_optimization = endpoint_mask is not None
+        ## end新增
         compression_ratio = data.meta_info.get("compression_ratio", 0.0)
         active_positions = data.meta_info.get("active_positions", 0)
         total_positions = data.meta_info.get("total_positions", 0)
-        
         if group_optimization:
             print(f"🎯 Actor收到GROUP标记: 压缩率={compression_ratio:.1%}, 活跃位置={active_positions}/{total_positions}")
 
-        ## end新增
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if multi_turn:
             select_keys.append("loss_mask")
@@ -411,7 +411,10 @@ class DataParallelPPOActor(BasePPOActor):
                                     print(f"🎯 Actor使用GROUP端点: {group_endpoint_mask.sum().item()} 个位置 (micro_batch)")
                             else:
                                 print(f"⚠️ endpoint_mask shape不匹配: {endpoint_mask.shape} vs expected ({batch_size}, {response_length})")
-                        
+                    
+                    # import pdb
+                    # pdb.set_trace()     
+                    
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
