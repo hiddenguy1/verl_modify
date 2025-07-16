@@ -255,63 +255,33 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         
-    ## 新增
     elif adv_estimator == AdvantageEstimator.GROUP:
-        
-        # import pdb
-        # pdb.set_trace() 
-        
-        # New GROUP algorithm implementation  
-        group_calculation_mask = data.batch["response_mask"]
-        if multi_turn:
-            response_length = group_calculation_mask.size(1)
-            group_calculation_mask = data.batch["loss_mask"][:, -response_length:]
-        
-        # Compute GROUP advantages
-        # advantages, returns = core_algos.compute_group_advantage(
-        #     token_level_rewards=data.batch["token_level_rewards"],
-        #     response_mask=group_calculation_mask,
-        #     index=data.non_tensor_batch["uid"],
-        #     values=data.batch["values"],
-        #     config=config,
-        #     old_log_prob=data.batch["old_log_probs"],
-        #     log_prob=data.batch["rollout_log_probs"],
-        # )
-        group_result = core_algos.compute_group_advantage(
+        ## 新增
+        # 1. 先用GAE算advantage（全token）
+        advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=group_calculation_mask,
-            index=data.non_tensor_batch["uid"],
             values=data.batch["values"],
-            config=config,
-            old_log_prob=data.batch["old_log_probs"],
-            log_prob=data.batch.get("rollout_log_probs", data.batch["old_log_probs"]),
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+            lam=lam,
         )
-        
-        # 🆕 处理不同长度的返回值
-        if isinstance(group_result, tuple) and len(group_result) == 3:
-            advantages, returns, monitoring_metrics = group_result
-            # 将监控指标存储到data.meta_info中，供后续使用
-            if not hasattr(data, 'meta_info'):
-                data.meta_info = {}
-            data.meta_info['group_monitoring_metrics'] = monitoring_metrics
-        elif isinstance(group_result, tuple) and len(group_result) == 2:
-            advantages, returns = group_result
-        else:
-            raise ValueError(f"GROUP algorithm returned unexpected number of values: {len(group_result) if isinstance(group_result, tuple) else 'not a tuple'}")
-        
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        
-        # # Compute GROUP-specific metrics for monitoring
-        # group_metrics = core_algos.compute_token_group_metrics(
-        #     token_level_rewards=data.batch["token_level_rewards"],
-        #     response_mask=group_calculation_mask,
-        #     advantages=advantages,
-        #     values=data.batch["values"],  # 移除 index 参数
-        #     config=config,
-        # )
+        # 2. 用_find_group_endpoints生成端点mask
+        batch_size, seq_len = data.batch["response_mask"].shape
+        endpoint_mask = torch.zeros_like(data.batch["response_mask"])
+        for i in range(batch_size):
+            mask = data.batch["response_mask"][i]
+            old_logprobs = data.batch["old_log_probs"][i]
+            new_logprobs = data.batch["rollout_log_probs"][i] if "rollout_log_probs" in data.batch else data.batch["old_log_probs"][i]
+            rewards = data.batch["token_level_rewards"][i]
+            values = data.batch["values"][i]
+            endpoints = core_algos._find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values)
+            for t in endpoints:
+                endpoint_mask[i, t] = 1
+        data.batch["endpoint_mask"] = endpoint_mask
+        ## end新增
         return data
-    ## end新增
     
     else:
         # handle all other adv estimator type other than GAE and GRPO
@@ -1145,7 +1115,7 @@ class RayPPOTrainer:
                         # compute advantages, executed on the driver process
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-                        ## 新增
+                        # ## 新增
                         # import pdb
                         # pdb.set_trace() 
                         if self.config.algorithm.adv_estimator == AdvantageEstimator.GROUP:
