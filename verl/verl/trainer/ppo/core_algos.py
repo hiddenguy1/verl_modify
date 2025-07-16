@@ -32,6 +32,7 @@ import verl.utils.torch_functional as verl_F
 from typing import Dict, Tuple
 ADV_ESTIMATOR_REGISTRY = {}
 
+
 def register_adv_est(name_or_enum):
     """Decorator to register a advantage estimator function with a given name.
 
@@ -539,75 +540,42 @@ def compute_policy_loss(
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
-
-    Adapted from
-    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
-
-    Args:
-        old_log_prob (torch.Tensor):
-            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
-        log_prob (torch.Tensor):
-            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
-        advantages (torch.Tensor):
-            Advantage estimates for each action, shape (batch_size, response_length).
-        response_mask (torch.Tensor):
-            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
-        cliprange (float, optional):
-            Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
-            Defaults to None (must be provided).
-        cliprange_low (float, optional):
-            Lower clip range for dual-clip PPO. Defaults to same as `cliprange`.
-        cliprange_high (float, optional):
-            Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
-        clip_ratio_c (float, optional):
-            Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
-            Defaults to 3.0.
-        loss_agg_mode (str, optional):
-            Aggregation mode for `agg_loss`. Defaults to "token-mean".
     """
-    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
+    # ## 新增: 端点mask处理
+    # 如果group_endpoints不为None，则只在端点位置计算损失
+    if group_endpoints is not None:
+        # group_endpoints: (batch, seq_len) 0/1 mask, 1表示端点
+        effective_mask = response_mask * group_endpoints
+    else:
+        effective_mask = response_mask
+    # ## end新增
 
     negative_approx_kl = log_prob - old_log_prob
     ratio = torch.exp(negative_approx_kl)
-    # ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-    
-    ## 新增
-    # 对于GROUP算法，需要先应用endpoint mask
-    if group_endpoints is not None:
-        endpoint_mask = group_endpoints.float() * response_mask
-        effective_mask = endpoint_mask
-    else:
-        effective_mask = response_mask
+    # ## 新增: 用effective_mask替换response_mask
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, effective_mask)
-    ## end新增
+    # ## end新增
+
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    
-    # pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-    ## 新增
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    # ## 新增: 用effective_mask替换response_mask
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), effective_mask)
-    ## end新增
-    
+    # ## end新增
+
     pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    
-    # pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
-    ## 新增
     pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), effective_mask)
-    ## end新增
-    
+
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    
-    # pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    ## 新增
+    # ## 新增: 用effective_mask替换response_mask
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=effective_mask, loss_agg_mode=loss_agg_mode)
-    ## end新增
-    
+    # ## end新增
+
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
@@ -765,477 +733,15 @@ def compute_pf_ppo_reweight_data(
     return resampled_data
 
 ## 新增
-# ### 计算GROUP_PPO的advantage 
-# @register_adv_est(AdvantageEstimator.GROUP)
-# def compute_group_advantage(
-#     token_level_rewards: torch.Tensor,
-#     response_mask: torch.Tensor,
-#     index: np.ndarray,
-#     values: torch.Tensor, 
-#     config=None,
-#     **kwargs,
-# ):
-#     """
-#     Compute advantage for GROUP algorithm based on dynamic GRPO vs PPO variance comparison.
-    
-#     This implementation follows Algorithm 2 Group from the paper, which dynamically
-#     decides grouping strategy based on the ratio of GRPO variance to PPO variance.
-    
-#     Args:
-#         token_level_rewards: (batch_size, response_length)
-#         response_mask: (batch_size, response_length) 
-#         index: (batch_size,) → group ID per sample
-#         config: Configuration containing GROUP algorithm parameters
-        
-#     Returns:
-#         advantages: (batch_size, response_length)
-#         returns: (batch_size, response_length)
-#     """
-#     assert config is not None, "GROUP algorithm requires config parameters"
-#     assert values is not None, "GROUP algorithm requires critic values"
+# Group_PPO说明：
+# 1. advantage一律用GAE（compute_gae_advantage_return）计算，所有token都要有。
+# 2. 只在分组端点（endpoints）上做PPO损失和反向传播，其余token直接mask掉或不参与loss计算。
+# 3. _find_group_endpoints用于生成端点mask。
+## end新增
 
-#     batch_size, response_length = token_level_rewards.shape
-#     scores = token_level_rewards.sum(dim=-1)  # 总奖励分数
-    
-#     # 初始化advantage为零
-#     advantages = torch.zeros_like(token_level_rewards)
-#     returns = torch.zeros_like(token_level_rewards)
-    
-#     # 按组分组
-#     id2indices = defaultdict(list)
-#     id2scores = defaultdict(list)
-#     id2values = defaultdict(list)
-#     id2masks = defaultdict(list)
-    
-#     for i in range(batch_size):
-#         group_id = index[i]
-#         id2indices[group_id].append(i)
-#         id2scores[group_id].append(scores[i])
-#         id2values[group_id].append(values[i])  # 使用critic values
-#         id2masks[group_id].append(response_mask[i])
-    
-#     with torch.no_grad():
-#         for group_id, group_indices in id2indices.items():
-#             group_scores = torch.stack(id2scores[group_id])
-#             group_values = torch.stack(id2values[group_id])  # critic values
-#             group_masks = torch.stack(id2masks[group_id])
-#             group_size = len(group_indices)
-            
-#             if group_size < 2:
-#                 # 单样本组，直接计算
-#                 single_idx = group_indices[0]
-#                 advantage_val = group_scores[0] - group_values[0].sum()  # reward - value
-#                 advantages[single_idx] = advantage_val * response_mask[single_idx]
-#                 returns[single_idx] = advantages[single_idx] + group_values[0]
-#                 continue
-            
-#             # 使用Algorithm 2确定组边界
-#             r_ppo = 0.0
-#             r_grpo = 0.0
-#             group_boundaries = []  # 记录组边界位置
-            
-#             # Compute group mean for baseline
-#             group_mean_reward = torch.mean(group_scores)
-#             group_mean_value = torch.mean(group_values.sum(dim=-1))
-            
-#             for n in range(group_size):
-#                 # 计算当前位置的梯度范数平方（简化为advantage平方）
-#                 current_advantage = group_scores[n] - group_values[n].sum()
-#                 current_grad_norm_sq = current_advantage ** 2
-                
-#                 # 累积PPO方差 (Algorithm 2: r_ppo += ||∇π_θ(s_n)||² Â_t²)
-#                 r_ppo += current_grad_norm_sq.item()
-                
-#                 # 计算GRPO方差 (Algorithm 2: r_grpo = ||∇(∏ π_θ(s_n))||² Â_t²)
-#                 if n > 0:
-#                     # 累积策略梯度范数（简化实现）
-#                     cumulative_advantages = group_scores[:n+1] - group_mean_value
-#                     cumulative_grad_norm_sq = torch.mean(cumulative_advantages ** 2)
-#                     r_grpo = cumulative_grad_norm_sq.item() * (n + 1)
-#                 else:
-#                     r_grpo = current_grad_norm_sq.item()
-                
-#                 # 检查分组条件：n ≥ r_grpo/r_ppo
-#                 if r_ppo > 1e-8 and n >= (r_grpo / r_ppo):
-#                     group_boundaries.append(n)  # 记录边界
-#                     r_ppo = 0.0
-#                     r_grpo = 0.0
-            
-#             # 确保最后一个位置也是边界
-#             if group_size - 1 not in group_boundaries:
-#                 group_boundaries.append(group_size - 1)
-            
-#             print(f"组 {group_id}: 大小={group_size}, 边界位置={group_boundaries}")
-    
-#             subgroup_start = 0
-#             for boundary_pos in group_boundaries:
-#                 # 计算这个子组的advantage (只在末端)
-#                 subgroup_indices = list(range(subgroup_start, boundary_pos + 1))
-#                 subgroup_scores = group_scores[subgroup_indices]
-#                 subgroup_values = group_values[subgroup_indices]
-                
-#                 # 子组baseline (使用critic values)
-#                 subgroup_value_baseline = torch.mean(subgroup_values.sum(dim=-1))
-#                 subgroup_reward_mean = torch.mean(subgroup_scores)
-                
-#                 # 🎯 关键：只为边界位置（末端）计算advantage
-#                 endpoint_idx = group_indices[boundary_pos]  # 全局索引
-#                 endpoint_advantage = subgroup_reward_mean - subgroup_value_baseline
-                
-#                 # 只有末端样本有advantage，其他样本advantage为0
-#                 advantages[endpoint_idx] = endpoint_advantage * response_mask[endpoint_idx]
-#                 returns[endpoint_idx] = advantages[endpoint_idx] + group_values[boundary_pos]
-                
-#                 # 子组内其他样本的advantage保持为0（已经初始化为0）
-#                 for sub_idx in subgroup_indices[:-1]:  # 除了末端
-#                     global_idx = group_indices[sub_idx]
-#                     advantages[global_idx] = 0.0  # 明确设置为0
-#                     returns[global_idx] = group_values[sub_idx]  # 只有value，没有advantage
-                
-#                 print(f"  子组 [{subgroup_start}:{boundary_pos}]: 只在位置{boundary_pos}计算advantage={endpoint_advantage:.4f}")
-                
-#                 subgroup_start = boundary_pos + 1
-    
-#     print(f"✅ 末端计算完成: {torch.sum(advantages != 0).item()} 个样本有非零advantage")
-    
-#     return advantages, returns
-
-
-# ## 计算GROUP_PPO的方差指标，方便检测和调参
-# def compute_group_variance_metrics(
-#     token_level_rewards: torch.Tensor,
-#     response_mask: torch.Tensor, 
-#     index: np.ndarray,
-#     advantages: torch.Tensor,
-# ) -> Dict[str, float]:
-#     """
-#     Compute variance metrics for GROUP algorithm monitoring.
-    
-#     Args:
-#         token_level_rewards: Token-level reward scores
-#         response_mask: Response attention mask
-#         index: Group indices 
-#         advantages: Computed advantages
-        
-#     Returns:
-#         Dictionary of variance metrics
-#     """
-#     batch_size = token_level_rewards.shape[0]
-#     scores = token_level_rewards.sum(dim=-1)
-    
-#     # Group-wise variance computation
-#     id2scores = defaultdict(list)
-#     for i in range(batch_size):
-#         id2scores[index[i]].append(scores[i])
-    
-#     group_variances = []
-#     ppo_variances = []
-#     grpo_variances = []
-    
-#     for group_scores in id2scores.values():
-#         if len(group_scores) > 1:
-#             group_scores_tensor = torch.tensor(group_scores)
-#             group_mean = torch.mean(group_scores_tensor)
-            
-#             # PPO-style variance (individual)
-#             ppo_var = torch.var(group_scores_tensor).item()
-#             ppo_variances.append(ppo_var)
-            
-#             # GRPO-style variance (cumulative)
-#             cumulative_vars = []
-#             for i in range(len(group_scores)):
-#                 cum_scores = group_scores_tensor[:i+1]
-#                 cum_var = torch.var(cum_scores).item() if len(cum_scores) > 1 else 0.0
-#                 cumulative_vars.append(cum_var)
-#             grpo_var = np.mean(cumulative_vars)
-#             grpo_variances.append(grpo_var)
-            
-#             group_variances.append(ppo_var)
-    
-#     metrics = {
-#         "group/ppo_variance_mean": np.mean(ppo_variances) if ppo_variances else 0.0,
-#         "group/grpo_variance_mean": np.mean(grpo_variances) if grpo_variances else 0.0,
-#         "group/variance_ratio_mean": np.mean([g/(p+1e-8) for g, p in zip(grpo_variances, ppo_variances)]) if grpo_variances and ppo_variances else 0.0,
-#         "group/num_groups": len(group_variances),
-#         "group/avg_group_size": batch_size / len(group_variances) if group_variances else 1.0,
-#     }
-    
-#     return metrics
-#     ## end新增
-
-## 新增：Token-Level分组的核心实现
-# @register_adv_est(AdvantageEstimator.GROUP)
-# def compute_group_advantage(
-#     token_level_rewards: torch.Tensor,
-#     response_mask: torch.Tensor,
-#     index: np.ndarray,
-#     values: torch.Tensor, 
-#     config=None,
-#     **kwargs,
-# ):
-#     """
-#     实现真正的token级别GROUP算法，基于Algorithm 2
-#     只在每个组的端点token计算advantage
-#     """
-#     batch_size, response_length = token_level_rewards.shape
-    
-#     # 初始化所有位置的advantage为零
-#     advantages = torch.zeros_like(token_level_rewards)
-#     returns = torch.zeros_like(token_level_rewards)
-    
-#     # 按组分组处理
-#     id2indices = defaultdict(list)
-#     for i in range(batch_size):
-#         id2indices[index[i]].append(i)
-    
-#     with torch.no_grad():
-#         for group_id, group_indices in id2indices.items():
-#             if len(group_indices) < 2:
-#                 # 单样本组，标准处理
-#                 single_idx = group_indices[0]
-#                 single_adv = token_level_rewards[single_idx] - values[single_idx]
-#                 advantages[single_idx] = single_adv * response_mask[single_idx]
-#                 returns[single_idx] = advantages[single_idx] + values[single_idx]
-#                 continue
-            
-#             # 对组内每个序列实现Algorithm 2的逻辑
-#             for seq_idx_in_group, global_seq_idx in enumerate(group_indices):
-#                 seq_rewards = token_level_rewards[global_seq_idx]
-#                 seq_values = values[global_seq_idx]
-#                 seq_mask = response_mask[global_seq_idx]
-                
-#                 # Algorithm 2: 动态确定端点
-#                 r_ppo = 0.0
-#                 r_grpo = 0.0
-#                 endpoints = []
-                
-#                 for t in range(response_length):
-#                     if seq_mask[t] == 0:
-#                         continue
-                    
-#                     # 计算梯度范数平方
-#                     current_advantage = seq_rewards[t] - seq_values[t]
-#                     grad_norm_sq = current_advantage ** 2
-                    
-#                     # 累积PPO方差
-#                     r_ppo += grad_norm_sq.item()
-                    
-#                     # 计算GRPO方差 
-#                     if t > 0:
-#                         cum_advantages = seq_rewards[:t+1] - seq_values[:t+1]
-#                         cum_advantages = cum_advantages * seq_mask[:t+1]
-#                         r_grpo = torch.mean(cum_advantages ** 2).item() * (t + 1)
-#                     else:
-#                         r_grpo = grad_norm_sq.item()
-                    
-#                     # Algorithm 2检查条件: t ≥ r_grpo/r_ppo
-#                     if r_ppo > 1e-8 and t >= (r_grpo / r_ppo):
-#                         endpoints.append(t)
-#                         r_ppo = 0.0
-#                         r_grpo = 0.0
-                
-#                 # 确保最后一个有效token是端点
-#                 valid_positions = torch.where(seq_mask > 0)[0]
-#                 if len(valid_positions) > 0:
-#                     last_pos = valid_positions[-1].item()
-#                     if last_pos not in endpoints:
-#                         endpoints.append(last_pos)
-                
-#                 # 只在端点计算advantage
-#                 for endpoint_pos in endpoints:
-#                     if endpoint_pos < response_length and seq_mask[endpoint_pos] > 0:
-#                         endpoint_reward = seq_rewards[endpoint_pos]
-#                         endpoint_value = seq_values[endpoint_pos]
-                        
-#                         # 使用组内对比作为baseline
-#                         group_baseline = torch.mean(torch.stack([
-#                             token_level_rewards[other_idx, endpoint_pos] 
-#                             for other_idx in group_indices 
-#                             if other_idx != global_seq_idx and endpoint_pos < response_length
-#                             and response_mask[other_idx, endpoint_pos] > 0
-#                         ])) if len(group_indices) > 1 else endpoint_value
-                        
-#                         endpoint_advantage = endpoint_reward - group_baseline
-#                         advantages[global_seq_idx, endpoint_pos] = endpoint_advantage
-#                         returns[global_seq_idx, endpoint_pos] = endpoint_advantage + endpoint_value
-    
-#     return advantages, returns
-
-# def compute_token_group_metrics(
-#     token_level_rewards: torch.Tensor,
-#     response_mask: torch.Tensor,
-#     advantages: torch.Tensor,
-#     values: torch.Tensor,
-#     config=None,
-# ) -> Dict[str, float]:
-#     """
-#     计算Token-Level分组的监控指标
-    
-#     Args:
-#         token_level_rewards: Token级别的reward
-#         response_mask: Response的有效mask
-#         advantages: 计算得到的advantage
-#         values: Critic的value估计
-#         config: 算法配置
-        
-#     Returns:
-#         包含各种监控指标的字典
-#     """
-#     batch_size, response_length = token_level_rewards.shape
-    
-#     # 统计指标
-#     total_tokens = int(response_mask.sum().item())
-#     non_zero_advantages = int((advantages != 0.0).sum().item())
-    
-#     if total_tokens == 0:
-#         return {
-#             "token_group/total_tokens": 0.0,
-#             "token_group/advantage_positions": 0.0,
-#             "token_group/compression_ratio": 0.0,
-#             "token_group/avg_group_size": 0.0,
-#         }
-    
-#     compression_ratio = 1.0 - (non_zero_advantages / total_tokens)
-#     avg_group_size = total_tokens / max(non_zero_advantages, 1)
-    
-#     # 计算方差指标
-#     valid_rewards = token_level_rewards[response_mask.bool()]
-#     valid_values = values[response_mask.bool()]
-#     valid_advantages = advantages[response_mask.bool()]
-    
-#     reward_variance = torch.var(valid_rewards).item() if len(valid_rewards) > 1 else 0.0
-#     advantage_variance = torch.var(valid_advantages).item() if len(valid_advantages) > 1 else 0.0
-    
-#     metrics = {
-#         "token_group/total_tokens": float(total_tokens),
-#         "token_group/advantage_positions": float(non_zero_advantages),
-#         "token_group/compression_ratio": compression_ratio,
-#         "token_group/avg_group_size": avg_group_size,
-#         "token_group/reward_variance": reward_variance,
-#         "token_group/advantage_variance": advantage_variance,
-#         "token_group/speedup_factor": 1.0 / (1.0 - compression_ratio + 1e-8),
-#     }
-    
-#     return metrics
-
-
-## v_1 无监控版本
-# @register_adv_est(AdvantageEstimator.GROUP)
-# def compute_group_advantage(
-#     token_level_rewards: torch.Tensor,
-#     response_mask: torch.Tensor,
-#     index: np.ndarray,
-#     values: torch.Tensor, 
-#     old_log_prob: torch.Tensor,  # 需要添加这个参数
-#     log_prob: torch.Tensor,      # 需要添加这个参数
-#     config=None,
-#     **kwargs,
-# ):
-#     """
-#     实现Group-based PPO算法
-#     Algorithm 1: 主PPO训练流程，只在组端点计算advantage
-#     Algorithm 2: 动态分组判断
-#     """
-#     batch_size, response_length = token_level_rewards.shape
-    
-#     # 初始化
-#     advantages = torch.zeros_like(token_level_rewards)
-#     returns = torch.zeros_like(token_level_rewards)
-    
-#     # 按组处理
-#     id2indices = defaultdict(list)
-#     for i in range(batch_size):
-#         id2indices[index[i]].append(i)
-    
-#     with torch.no_grad():
-#         for group_id, group_indices in id2indices.items():
-#             for global_seq_idx in group_indices:
-#                 seq_rewards = token_level_rewards[global_seq_idx]
-#                 seq_values = values[global_seq_idx]
-#                 seq_mask = response_mask[global_seq_idx]
-#                 seq_old_logprob = old_log_prob[global_seq_idx]
-#                 seq_new_logprob = log_prob[global_seq_idx]
-                
-#                 # Algorithm 2: 动态确定分组端点
-#                 endpoints = _find_group_endpoints(
-#                     seq_mask, seq_old_logprob, seq_new_logprob, 
-#                     seq_rewards, seq_values
-#                 )
-                
-#                 # Algorithm 1: 只在端点计算advantage
-#                 for endpoint_pos in endpoints:
-#                     if endpoint_pos < response_length and seq_mask[endpoint_pos] > 0:
-#                         # 计算到端点的累积奖励
-#                         cumulative_reward = torch.sum(
-#                             seq_rewards[:endpoint_pos+1] * seq_mask[:endpoint_pos+1]
-#                         )
-                        
-#                         # 使用端点的value作为baseline
-#                         endpoint_value = seq_values[endpoint_pos]
-                        
-#                         # 计算advantage (Algorithm 1, step 7)
-#                         advantage = cumulative_reward - endpoint_value
-#                         advantages[global_seq_idx, endpoint_pos] = advantage
-#                         returns[global_seq_idx, endpoint_pos] = advantage + endpoint_value
-    
-#     return advantages, returns
-
-
-# def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values):
-#     """
-#     Algorithm 2: 动态确定分组端点
-#     """
-#     endpoints = []
-#     r_ppo = 0.0
-#     r_grpo = 0.0
-#     response_length = len(mask)
-    
-#     # 有效位置
-#     valid_positions = torch.where(mask > 0)[0]
-#     if len(valid_positions) == 0:
-#         return endpoints
-    
-#     N = len(valid_positions)  # 序列长度
-    
-#     for step, t in enumerate(valid_positions):
-#         t = t.item()
-        
-#         # 计算当前位置的advantage^2 (Â²_t)
-#         current_advantage = rewards[t] - values[t]
-#         advantage_squared = current_advantage ** 2
-        
-#         # 计算策略梯度范数的近似 ||∇π_θ(s_n)||²
-#         policy_ratio = torch.exp(new_logprobs[t] - old_logprobs[t])
-#         grad_norm_sq_approx = (policy_ratio - 1.0) ** 2
-        
-#         # Algorithm 2 公式计算
-#         # r_ppo ← r_ppo + (1/N) ||∇π_θ(s_n)||² Â²_t
-#         r_ppo += (1.0 / N) * grad_norm_sq_approx * advantage_squared
-        
-#         # r_grpo ← (1/N) ||∇(∏π_θ(s_n))||² Â²_t
-#         if step == 0:
-#             cumulative_policy_grad = grad_norm_sq_approx
-#         else:
-#             cumulative_policy_grad *= (1 + grad_norm_sq_approx)
-        
-#         r_grpo = (1.0 / N) * cumulative_policy_grad * advantage_squared
-        
-#         # Algorithm 2 判断条件: if n ≥ r_grpo/r_ppo then
-#         n = step + 1  # 当前步数 (从1开始)
-#         if r_ppo > 1e-8 and n >= (r_grpo / r_ppo):
-#             endpoints.append(t)
-#             # 重置累积器
-#             r_ppo = 0.0
-#             r_grpo = 0.0
-    
-#     # 确保最后一个有效位置是端点
-#     last_valid_pos = valid_positions[-1].item()
-#     if last_valid_pos not in endpoints:
-#         endpoints.append(last_valid_pos)
-    
-#     return endpoints
+## 新增
 @register_adv_est(AdvantageEstimator.GROUP)
-def compute_group_advantage(
+def  compute_group_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
@@ -1251,7 +757,7 @@ def compute_group_advantage(
     batch_size, response_length = token_level_rewards.shape
     
     # 初始化
-    advantages = torch.zeros_like(token_level_rewards)
+    advantages = token_level_rewards
     returns = torch.zeros_like(token_level_rewards)
     
     # 🆕 全局统计信息
@@ -1324,6 +830,9 @@ def compute_group_advantage(
                             'value': endpoint_value.item()
                         })
                 
+                # import pdb
+                # pdb.set_trace()  # 调试断点
+                
                 # 🆕 记录序列详细信息
                 seq_detail = {
                     'seq_idx': seq_idx,
@@ -1371,11 +880,14 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
     for step, t in enumerate(valid_positions):
         t = t.item()
         
+        # import pdb 
+        # pdb.set_trace()  # 调试断点
+        
         # 计算当前位置的advantage^2 (Â²_t)
         current_advantage = rewards[t] - values[t]
         advantage_squared = current_advantage ** 2
         
-        # 计算策略梯度范数的近似 ||∇π_θ(s_n)||²
+        # # 计算策略梯度范数的近似 ||∇π_θ(s_n)||²
         policy_ratio = torch.exp(new_logprobs[t] - old_logprobs[t])
         grad_norm_sq_approx = (policy_ratio - 1.0) ** 2
         
@@ -1383,14 +895,11 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
         # r_ppo ← r_ppo + (1/N) ||∇π_θ(s_n)||² Â²_t
         r_ppo += (1.0 / N) * grad_norm_sq_approx * advantage_squared
         
-        # r_grpo ← (1/N) ||∇(∏π_θ(s_n))||² Â²_t
-        if step == 0:
-            cumulative_policy_grad = grad_norm_sq_approx
-        else:
-            cumulative_policy_grad *= (1 + grad_norm_sq_approx)
+        cumulative_log_ratio = new_logprobs[valid_positions[:step+1]] - old_logprobs[valid_positions[:step+1]]
+        cumulative_grad_norm_sq = torch.sum(cumulative_log_ratio)** 2
+        r_grpo = (1.0 / N) * cumulative_grad_norm_sq * advantage_squared
         
-        r_grpo = (1.0 / N) * cumulative_policy_grad * advantage_squared
-        
+    
         # 🆕 记录每步的详细信息
         step_detail = {
             'step': step + 1,
@@ -1402,6 +911,8 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
             'ratio': (r_grpo / r_ppo).item() if r_ppo > 1e-8 else float('inf'),
             'is_endpoint': False
         }
+        # import pdb
+        # pdb.set_trace()  # 调试断点
         
         # Algorithm 2 判断条件: if n ≥ r_grpo/r_ppo then
         n = step + 1  # 当前步数 (从1开始)
@@ -1431,6 +942,9 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
             'step_details': step_info,
             'compression_ratio': 1.0 - (len(endpoints) / N) if N > 0 else 0.0
         })
+    
+    # import pdb
+    # pdb.set_trace()  # 调试断点
     
     return endpoints
 
