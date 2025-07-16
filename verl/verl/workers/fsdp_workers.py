@@ -600,48 +600,6 @@ class ActorRolloutRefWorker(Worker):
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
 
-    # @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    # def update_actor(self, data: DataProto):
-    #     # Support all hardwares
-    #     data = data.to(get_torch_device().current_device())
-
-    #     assert self._is_actor
-    #     if self._is_offload_param:
-    #         load_fsdp_model_to_gpu(self.actor_module_fsdp)
-    #     if self._is_offload_optimizer:
-    #         load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
-
-    #     with self.ulysses_sharding_manager:
-    #         data = self.ulysses_sharding_manager.preprocess_data(data=data)
-    #         # perform training
-    #         with Timer(name="update_policy", logger=None) as timer:
-    #             metrics = self.actor.update_policy(data=data)
-    #         delta_time = timer.last
-    #         global_num_tokens = data.meta_info["global_token_num"]
-    #         estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-    #         metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
-    #         metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
-    #         metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-    #         metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
-
-    #         lr = self.actor_lr_scheduler.get_last_lr()[0]
-    #         metrics["actor/lr"] = lr
-    #         self.actor_lr_scheduler.step()
-
-    #         # TODO: here, we should return all metrics
-    #         output = DataProto(meta_info={"metrics": metrics})
-
-    #         output = self.ulysses_sharding_manager.postprocess_data(data=output)
-    #         output = output.to("cpu")
-
-    #     if self._is_offload_param:
-    #         offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-    #         log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
-    #     if self._is_offload_optimizer:
-    #         offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-    #         log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
-
-    #     return output
     ## 新增
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -689,34 +647,27 @@ class ActorRolloutRefWorker(Worker):
         🆕 新增：智能检测是否应该使用 GROUP 优化
         """
         try:
-            # ❌ 错误的访问方式
-            # algorithm_config = getattr(self.config, 'algorithm', None)
-            
-            # ✅ 正确的访问方式：直接检查 meta_info
-            # 因为算法类型应该在 ray_trainer.py 中已经决定了
+            ## 新增
+            # 优先判断是否有 endpoint_mask 字段
+            if 'endpoint_mask' in data.batch:
+                return True
+            ## end新增
             if hasattr(data, 'meta_info') and data.meta_info.get('algorithm_type') == 'group':
                 return True
-            
             # 🔧 备选方案：检查 advantages 的稀疏性（如果算法配置访问失败）
             if 'advantages' in data.batch and 'response_mask' in data.batch:
                 advantages = data.batch['advantages']
                 response_mask = data.batch['response_mask']
-                
                 total_positions = int(response_mask.sum().item())
                 if total_positions > 0:
                     non_zero_positions = int((advantages != 0.0).sum().item())
                     sparsity_ratio = non_zero_positions / total_positions
-                    
-                    # 如果稀疏度低于50%，很可能是GROUP算法
                     if sparsity_ratio < 0.5:
                         if hasattr(self, 'rank') and self.rank == 0:
                             print(f"⚡ 检测到稀疏advantage ({sparsity_ratio:.1%})，使用GROUP优化")
                         return True
-            
             return False
-        
         except Exception as e:
-            # 任何异常都回退到标准路径
             if hasattr(self, 'rank') and self.rank == 0:
                 print(f"Warning: GROUP detection failed ({e}), using standard path")
             return False
@@ -793,9 +744,13 @@ class ActorRolloutRefWorker(Worker):
         """
         advantages = data.batch["advantages"]
         response_mask = data.batch["response_mask"]
-        
-        # 计算稀疏性统计
-        non_zero_adv_mask = (advantages != 0.0) & (response_mask.bool())
+        ## 新增
+        endpoint_mask = data.batch.get("endpoint_mask", None)
+        if endpoint_mask is not None:
+            non_zero_adv_mask = endpoint_mask.bool()
+        else:
+            non_zero_adv_mask = (advantages != 0.0) & (response_mask.bool())
+        ## end新增
         total_positions = int(response_mask.sum().item())
         active_positions = int(non_zero_adv_mask.sum().item())
         compression_ratio = 1.0 - (active_positions / max(total_positions, 1))
