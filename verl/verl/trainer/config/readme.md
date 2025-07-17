@@ -134,6 +134,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 
 ```
 #### 使用说明：
-- 直接复制保存为 run_groupppo_3b.sh，chmod +x run_groupppo_3b.sh 后运行即可。
+- 直接复制保存为 run_groupppo_3b.sh，运行即可。
 - 如遇OOM，优先减小 data.train_batch_size 或序列长度。
 - 路径、模型名等可根据实际情况调整。
