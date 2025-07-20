@@ -753,12 +753,16 @@ def  compute_group_advantage(
 ):
     """
     实现Group-based PPO算法 (增强监控版本)
+    新增功能：分组内advantage广播
     """
     batch_size, response_length = token_level_rewards.shape
     
     # 初始化
-    advantages = token_level_rewards
+    advantages = torch.zeros_like(token_level_rewards)
     returns = torch.zeros_like(token_level_rewards)
+    
+    # 🆕 新增：分组mask，用于标识每个token属于哪个分组
+    group_mask = torch.zeros_like(token_level_rewards, dtype=torch.long)
     
     # 🆕 全局统计信息
     global_stats = {
@@ -777,6 +781,19 @@ def  compute_group_advantage(
     
     global_stats['total_groups'] = len(id2indices)
     
+    # 🆕 创建group_id到整数的映射，确保所有group_id都是整数
+    unique_group_ids = list(id2indices.keys())
+    group_id_to_int = {}
+    for idx, group_id in enumerate(unique_group_ids):
+        if isinstance(group_id, str):
+            # 如果是字符串，尝试转换为整数，如果失败则使用索引
+            try:
+                group_id_to_int[group_id] = int(group_id)
+            except ValueError:
+                group_id_to_int[group_id] = idx + 1
+        else:
+            group_id_to_int[group_id] = int(group_id)
+    
     with torch.no_grad():
         for group_id, group_indices in id2indices.items():
             group_detail = {
@@ -784,56 +801,54 @@ def  compute_group_advantage(
                 'group_size': len(group_indices),
                 'sequences': []
             }
-            
+            group_endpoint_advantages = []
+            group_endpoint_positions = []
             for seq_idx, global_seq_idx in enumerate(group_indices):
                 seq_rewards = token_level_rewards[global_seq_idx]
                 seq_values = values[global_seq_idx]
                 seq_mask = response_mask[global_seq_idx]
                 seq_old_logprob = old_log_prob[global_seq_idx]
                 seq_new_logprob = log_prob[global_seq_idx]
-                
-                # 🆕 为每个序列收集debug信息
                 debug_info = {}
-                
-                # Algorithm 2: 动态确定分组端点
                 endpoints = _find_group_endpoints(
                     seq_mask, seq_old_logprob, seq_new_logprob, 
                     seq_rewards, seq_values, debug_info
                 )
-                
-                # 统计信息
                 valid_tokens = int(seq_mask.sum().item())
                 global_stats['total_tokens'] += valid_tokens
                 global_stats['total_endpoints'] += len(endpoints)
-                
-                # Algorithm 1: 只在端点计算advantage
-                endpoint_advantages = []
-                for endpoint_pos in endpoints:
+                # === 修正分组mask为token级分组ID ===
+                # endpoints为分组末端，分组区间为[start:end]
+                last_pos = -1
+                for seg_idx, endpoint_pos in enumerate(endpoints):
                     if endpoint_pos < response_length and seq_mask[endpoint_pos] > 0:
+                        # 分组区间：[last_pos+1, endpoint_pos]
+                        group_mask[global_seq_idx, last_pos+1:endpoint_pos+1] = seg_idx + 1  # 分组ID从1开始
                         # 计算到端点的累积奖励
                         cumulative_reward = torch.sum(
                             seq_rewards[:endpoint_pos+1] * seq_mask[:endpoint_pos+1]
                         )
-                        
-                        # 使用端点的value作为baseline
                         endpoint_value = seq_values[endpoint_pos]
-                        
-                        # 计算advantage (Algorithm 1, step 7)
                         advantage = cumulative_reward - endpoint_value
-                        advantages[global_seq_idx, endpoint_pos] = advantage
+                        group_endpoint_advantages.append(advantage)
+                        group_endpoint_positions.append((global_seq_idx, endpoint_pos))
                         returns[global_seq_idx, endpoint_pos] = advantage + endpoint_value
-                        
+                    last_pos = endpoint_pos
+                # === END 修正 ===
+                endpoint_advantages = []
+                for endpoint_pos in endpoints:
+                    if endpoint_pos < response_length and seq_mask[endpoint_pos] > 0:
+                        cumulative_reward = torch.sum(
+                            seq_rewards[:endpoint_pos+1] * seq_mask[:endpoint_pos+1]
+                        )
+                        endpoint_value = seq_values[endpoint_pos]
+                        advantage = cumulative_reward - endpoint_value
                         endpoint_advantages.append({
                             'position': endpoint_pos,
                             'advantage': advantage.item(),
                             'cumulative_reward': cumulative_reward.item(),
                             'value': endpoint_value.item()
                         })
-                
-                # import pdb
-                # pdb.set_trace()  # 调试断点
-                
-                # 🆕 记录序列详细信息
                 seq_detail = {
                     'seq_idx': seq_idx,
                     'global_idx': global_seq_idx,
@@ -844,23 +859,32 @@ def  compute_group_advantage(
                     'compression_ratio': debug_info.get('compression_ratio', 0.0),
                     'step_details': debug_info.get('step_details', [])
                 }
-                
                 group_detail['sequences'].append(seq_detail)
                 global_stats['sequence_details'].append(seq_detail)
-            
+            if group_endpoint_advantages:
+                group_avg_advantage = torch.stack(group_endpoint_advantages).mean()
+                for global_seq_idx in group_indices:
+                    seq_mask = response_mask[global_seq_idx]
+                    advantages[global_seq_idx] = group_avg_advantage * seq_mask.float()
             global_stats['group_details'].append(group_detail)
-    
+
     # 🆕 打印详细统计信息
     _print_group_statistics(global_stats)
     
     # 🆕 返回额外的监控指标
     monitoring_metrics = _compute_monitoring_metrics(global_stats, advantages, response_mask)
     
-    return advantages, returns, monitoring_metrics
+    # 🆕 新增：返回分组mask，用于后续训练
+    return advantages, returns, monitoring_metrics, group_mask
 ## v_2 增加监控
 def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, debug_info=None):
     """
-    Algorithm 2: 动态确定分组端点 (增强debug版本)
+    Algorithm 2: 动态确定分组端点 (完全按照论文实现)
+    
+    论文中的Algorithm 2 Group:
+    - r_ppo ← (1/N) || Σ_{n=1}^t Â_n ⋅ ∇ ln π_θ(s_n) ||^2
+    - r_grpo ← (1/N) || Σ_{n=1}^t ∇ ln π_θ(s_n) ||^2 Â_t^2
+    - if t ≥ r_grpo / r_ppo then: 重置累积器
     """
     endpoints = []
     r_ppo = 0.0
@@ -877,51 +901,57 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
     # 🆕 Debug信息收集
     step_info = []
     
+    # 累积梯度向量
+    cumulative_advantage_grad = torch.zeros_like(old_logprobs)
+    cumulative_grad = torch.zeros_like(old_logprobs)
+    
     for step, t in enumerate(valid_positions):
         t = t.item()
         
-        # import pdb 
-        # pdb.set_trace()  # 调试断点
-        
-        # 计算当前位置的advantage^2 (Â²_t)
+        # 计算当前位置的advantage (Â_t)
         current_advantage = rewards[t] - values[t]
-        advantage_squared = current_advantage ** 2
         
-        # # 计算策略梯度范数的近似 ||∇π_θ(s_n)||²
-        policy_ratio = torch.exp(new_logprobs[t] - old_logprobs[t])
-        grad_norm_sq_approx = (policy_ratio - 1.0) ** 2
+        # 计算策略梯度 ∇ ln π_θ(s_t)
+        policy_grad = new_logprobs[t] - old_logprobs[t]  # ∇ ln π_θ(s_t)
         
-        # Algorithm 2 公式计算
-        # r_ppo ← r_ppo + (1/N) ||∇π_θ(s_n)||² Â²_t
-        r_ppo += (1.0 / N) * grad_norm_sq_approx * advantage_squared
+        # 累积梯度向量 (从1到t)
+        t_idx = int(t)
+        if t_idx > 0:
+            cumulative_advantage_grad[t_idx] = cumulative_advantage_grad[t_idx-1] + current_advantage * policy_grad
+            cumulative_grad[t_idx] = cumulative_grad[t_idx-1] + policy_grad
+        else:
+            cumulative_advantage_grad[t_idx] = current_advantage * policy_grad
+            cumulative_grad[t_idx] = policy_grad
         
-        cumulative_log_ratio = new_logprobs[valid_positions[:step+1]] - old_logprobs[valid_positions[:step+1]]
-        cumulative_grad_norm_sq = torch.sum(cumulative_log_ratio)** 2
-        r_grpo = (1.0 / N) * cumulative_grad_norm_sq * advantage_squared
+        # 论文公式计算
+        # r_ppo ← (1/N) || Σ_{n=1}^t Â_n ⋅ ∇ ln π_θ(s_n) ||^2
+        r_ppo = (1.0 / N) * (cumulative_advantage_grad[t_idx] ** 2)
         
-    
+        # r_grpo ← (1/N) || Σ_{n=1}^t ∇ ln π_θ(s_n) ||^2 Â_t^2
+        r_grpo = (1.0 / N) * (cumulative_grad[t_idx] ** 2) * (current_advantage ** 2)
+        
         # 🆕 记录每步的详细信息
         step_detail = {
             'step': step + 1,
             'position': t,
             'advantage': current_advantage.item(),
-            'policy_ratio': policy_ratio.item(),
+            'policy_grad': policy_grad.item(),
             'r_ppo': r_ppo.item(),
             'r_grpo': r_grpo.item(),
             'ratio': (r_grpo / r_ppo).item() if r_ppo > 1e-8 else float('inf'),
             'is_endpoint': False
         }
-        # import pdb
-        # pdb.set_trace()  # 调试断点
         
-        # Algorithm 2 判断条件: if n ≥ r_grpo/r_ppo then
-        n = step + 1  # 当前步数 (从1开始)
-        if r_ppo > 1e-8 and n >= (r_grpo / r_ppo):
+        # Algorithm 2 判断条件: if t ≥ r_grpo/r_ppo then
+        if r_ppo > 1e-8 and (step + 1) >= (r_grpo / r_ppo):
             endpoints.append(t)
             step_detail['is_endpoint'] = True
             # 重置累积器
             r_ppo = 0.0
             r_grpo = 0.0
+            # 重置累积梯度向量
+            cumulative_advantage_grad = torch.zeros_like(old_logprobs)
+            cumulative_grad = torch.zeros_like(old_logprobs)
         
         step_info.append(step_detail)
     
@@ -942,9 +972,6 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
             'step_details': step_info,
             'compression_ratio': 1.0 - (len(endpoints) / N) if N > 0 else 0.0
         })
-    
-    # import pdb
-    # pdb.set_trace()  # 调试断点
     
     return endpoints
 
@@ -1154,3 +1181,38 @@ def _compute_monitoring_metrics(global_stats, advantages, response_mask):
     metrics['group/kpi_health'] = metrics.get('group/algorithm_effectiveness', 0.5)
     
     return metrics
+
+
+def create_critic_endpoint_mask(response_mask: torch.Tensor, group_mask: torch.Tensor) -> torch.Tensor:
+    """
+    为Critic训练创建端点mask
+    
+    Args:
+        response_mask: (batch_size, response_length) 响应mask
+        group_mask: (batch_size, response_length) 分组mask
+        
+    Returns:
+        endpoint_mask: (batch_size, response_length) 端点mask，只在每个分组的最后一个有效token位置为True
+    """
+    endpoint_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    batch_size = response_mask.shape[0]
+    
+    for i in range(batch_size):
+        seq_mask = response_mask[i]
+        seq_group_mask = group_mask[i]
+        
+        # 找到该序列中每个分组的最后一个有效token
+        valid_positions = torch.where(seq_mask > 0)[0]
+        if len(valid_positions) > 0:
+            # 按分组找到每个分组的最后一个位置
+            unique_groups = torch.unique(seq_group_mask[valid_positions])
+            for group_id in unique_groups:
+                if group_id == 0:  # 跳过无效分组
+                    continue
+                # 找到该分组在该序列中的最后一个位置
+                group_positions = valid_positions[seq_group_mask[valid_positions] == group_id]
+                if len(group_positions) > 0:
+                    last_group_pos = group_positions[-1]
+                    endpoint_mask[i, last_group_pos] = True
+    
+    return endpoint_mask
