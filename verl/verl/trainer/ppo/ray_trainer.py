@@ -256,31 +256,46 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["returns"] = returns
         
     elif adv_estimator == AdvantageEstimator.GROUP:
-        ## 新增
-        # 1. 先用GAE算advantage（全token）
-        advantages, returns = core_algos.compute_gae_advantage_return(
+        ## 新增：使用新的GROUP算法实现
+        # 调用compute_group_advantage函数
+        group_result = core_algos.compute_group_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
-            values=data.batch["values"],
             response_mask=data.batch["response_mask"],
-            gamma=gamma,
-            lam=lam,
+            index=data.non_tensor_batch["uid"],
+            values=data.batch["values"],
+            config=config,
+            old_log_prob=data.batch["old_log_probs"],
+            log_prob=data.batch.get("rollout_log_probs", data.batch["old_log_probs"]),
         )
+        
+        # 🆕 处理新的返回值格式
+        if isinstance(group_result, tuple) and len(group_result) == 4:
+            advantages, returns, monitoring_metrics, group_mask = group_result
+            # 将监控指标存储到data.meta_info中，供后续使用
+            if not hasattr(data, 'meta_info'):
+                data.meta_info = {}
+            data.meta_info['group_monitoring_metrics'] = monitoring_metrics
+            data.meta_info['group_optimization'] = True
+            data.meta_info['compression_ratio'] = monitoring_metrics.get('group/compression_ratio', 0.0)
+            data.meta_info['active_positions'] = int(monitoring_metrics.get('group/total_endpoints', 0))
+            data.meta_info['total_positions'] = int(monitoring_metrics.get('group/total_tokens', 0))
+        elif isinstance(group_result, tuple) and len(group_result) == 3:
+            advantages, returns, monitoring_metrics = group_result
+            group_mask = None
+            if not hasattr(data, 'meta_info'):
+                data.meta_info = {}
+            data.meta_info['group_monitoring_metrics'] = monitoring_metrics
+            data.meta_info['group_optimization'] = True
+        else:
+            raise ValueError(f"GROUP algorithm returned unexpected number of values: {len(group_result) if isinstance(group_result, tuple) else 'not a tuple'}")
+        
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        # 2. 用_find_group_endpoints生成端点mask
-        batch_size, seq_len = data.batch["response_mask"].shape
-        endpoint_mask = torch.zeros_like(data.batch["response_mask"])
-        for i in range(batch_size):
-            mask = data.batch["response_mask"][i]
-            old_logprobs = data.batch["old_log_probs"][i]
-            new_logprobs = data.batch["rollout_log_probs"][i] if "rollout_log_probs" in data.batch else data.batch["old_log_probs"][i]
-            rewards = data.batch["token_level_rewards"][i]
-            values = data.batch["values"][i]
-            endpoints = core_algos._find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values)
-            for t in endpoints:
-                endpoint_mask[i, t] = 1
-        data.batch["endpoint_mask"] = endpoint_mask
-        ## end新增
+        
+        # 🆕 新增：存储分组mask，用于后续训练
+        if group_mask is not None:
+            data.batch["group_mask"] = group_mask
+        
         return data
     
     else:
