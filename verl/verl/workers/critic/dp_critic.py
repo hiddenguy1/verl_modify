@@ -197,7 +197,15 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module.train()
         metrics = {}
 
-        select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        # 🆕 新增：检测GROUP算法
+        group_optimization = data.meta_info.get("group_optimization", False)
+        if group_optimization:
+            print(f"🎯 Critic使用GROUP算法: 只在分组末端计算价值损失")
+            # 添加group_mask到select_keys
+            select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns", "group_mask"]
+        else:
+            select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+            
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -243,13 +251,32 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     vpreds = self._forward_micro_batch(data)
 
-                    # assert not torch.any(torch.isnan(vpreds)).item()
+                    # 🆕 新增：GROUP算法处理
+                    if group_optimization and "group_mask" in data:
+                        # 只在分组末端计算价值损失
+                        group_mask = data["group_mask"]
+                        
+                        # 使用新的端点mask生成函数
+                        from verl.trainer.ppo.core_algos import create_critic_endpoint_mask
+                        endpoint_mask = create_critic_endpoint_mask(response_mask, group_mask)
+                        
+                        # 调试：打印每个response的端点数和总端点数
+                        print("endpoint_mask shape:", endpoint_mask.shape)
+                        print("endpoint_mask sum per response:", endpoint_mask.sum(dim=1).tolist())
+                        print("endpoint_mask total sum:", endpoint_mask.sum().item())
+                        
+                        # 使用端点mask计算价值损失
+                        effective_mask = endpoint_mask.float() * response_mask.float()
+                        print(f"🎯 Critic端点mask: {effective_mask.sum().item()} 个位置参与训练")
+                    else:
+                        # 标准PPO：所有token都参与
+                        effective_mask = response_mask
 
                     vf_loss, vf_clipfrac = core_algos.compute_value_loss(
                         vpreds=vpreds,
                         values=values,
                         returns=returns,
-                        response_mask=response_mask,
+                        response_mask=effective_mask,  # 🆕 使用effective_mask
                         cliprange_value=self.config.cliprange_value,
                         loss_agg_mode=self.config.loss_agg_mode,
                     )
