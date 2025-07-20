@@ -397,23 +397,11 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
-                    ## 新增
-                    group_endpoint_mask = None
-                    if group_optimization and endpoint_mask is not None:
-                        # 需要为当前micro_batch计算对应的endpoint_mask片段
-                        batch_size = advantages.shape[0]
-                        if batch_size == 1:  # 单样本情况下直接使用
-                            # 从全局的endpoint_mask中提取当前micro_batch对应的部分
-                            # 这里假设endpoint_mask的shape与advantages匹配
-                            if endpoint_mask.shape[0] >= batch_size and endpoint_mask.shape[1] == response_length:
-                                group_endpoint_mask = endpoint_mask[:batch_size, :response_length]
-                                if group_endpoint_mask.sum().item() > 0:
-                                    print(f"🎯 Actor使用GROUP端点: {group_endpoint_mask.sum().item()} 个位置 (micro_batch)")
-                            else:
-                                print(f"⚠️ endpoint_mask shape不匹配: {endpoint_mask.shape} vs expected ({batch_size}, {response_length})")
-                    
-                    # import pdb
-                    # pdb.set_trace()     
+                    ## 新增：GROUP算法处理
+                    # 对于GROUP算法，advantage已经在分组内广播，所有token都应该参与训练
+                    # 不再使用端点mask限制，因为advantage已经广播到分组内所有token
+                    if group_optimization:
+                        print(f"🎯 Actor使用GROUP广播advantage: 所有分组内token参与训练")
                     
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
@@ -425,7 +413,8 @@ class DataParallelPPOActor(BasePPOActor):
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
-                        group_endpoints=group_endpoint_mask,  ## 新增
+                        # 🆕 移除group_endpoints参数，让所有token参与训练
+                        # group_endpoints=group_endpoint_mask,  ## 注释掉
                     )
 
                     if entropy_coeff != 0:
