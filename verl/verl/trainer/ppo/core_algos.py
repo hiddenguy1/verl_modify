@@ -879,9 +879,9 @@ def  compute_group_advantage(
 ## v_2 增加监控
 def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, debug_info=None):
     """
-    Algorithm 2: 动态确定分组端点 (完全按照论文实现)
+    Algorithm 2: 动态确定分组端点
     
-    论文中的Algorithm 2 Group:
+    Group:
     - r_ppo ← (1/N) || Σ_{n=1}^t Â_n ⋅ ∇ ln π_θ(s_n) ||^2
     - r_grpo ← (1/N) || Σ_{n=1}^t ∇ ln π_θ(s_n) ||^2 Â_t^2
     - if t ≥ r_grpo / r_ppo then: 重置累积器
@@ -923,7 +923,7 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
             cumulative_advantage_grad[t_idx] = current_advantage * policy_grad
             cumulative_grad[t_idx] = policy_grad
         
-        # 论文公式计算
+        # 公式计算
         # r_ppo ← (1/N) || Σ_{n=1}^t Â_n ⋅ ∇ ln π_θ(s_n) ||^2
         r_ppo = (1.0 / N) * (cumulative_advantage_grad[t_idx] ** 2)
         
