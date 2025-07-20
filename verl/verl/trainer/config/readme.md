@@ -39,44 +39,39 @@
 
 ### 首先用小batch，短prompt，短response来跑
 ```bash
-#!/bin/bash
-
-PROJECT_NAME="group_qwen_3b"
-export WANDB_PROJECT=${PROJECT_NAME}
-
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-  data.train_files=/workspace/verl_modify/verl/data/gsm8k/train.parquet \
-  data.val_files=/workspace/verl_modify/verl/data/gsm8k/test.parquet \
-  data.train_batch_size=16 \                # 8卡，每卡2
-  data.max_prompt_length=128 \              # 先用128，防止OOM
-  data.max_response_length=64 \             # 先用64，防止OOM
-  actor_rollout_ref.model.path=/workspace/verl_modify/verl/models/Qwen2.5-3B-Instruct \
-  actor_rollout_ref.actor.optim.lr=1e-6 \
-  actor_rollout_ref.actor.ppo_mini_batch_size=4 \      # mini_batch_size < train_batch_size
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
-  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
-  actor_rollout_ref.rollout.n=1 \
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-  critic.optim.lr=1e-5 \
-  critic.model.path=/workspace/verl_modify/verl/models/Qwen2.5-3B-Instruct \
-  critic.ppo_micro_batch_size_per_gpu=1 \
-  algorithm.adv_estimator=group_ppo \       # 启用Group_PPO
-  algorithm.group_params.group_variance_threshold=0.8 \
-  algorithm.group_params.group_max_size=8 \
-  algorithm.group_params.group_epsilon=1e-6 \
-  algorithm.group_params.adaptive_threshold=false \
-  algorithm.kl_ctrl.kl_coef=0.001 \
-  trainer.project_name=group_qwen_3b \
-  trainer.logger=['wandb'] \
-  trainer.val_before_train=False \
-  trainer.default_hdfs_dir=null \
-  trainer.n_gpus_per_node=8 \               # 8卡
-  trainer.nnodes=1 \
-  trainer.save_freq=50 \
-  trainer.test_freq=50 \
-  trainer.total_epochs=1 2>&1 | tee verl_group_demo_2.log
+ data.train_files=/workspace/verl/data/gsm8k/train.parquet \
+ data.val_files=/workspace/verl/data/gsm8k/test.parquet \
+ data.train_batch_size=64 \
+ data.max_prompt_length=256 \
+ data.max_response_length=128 \
+ actor_rollout_ref.model.path=/workspace/verl/models/Qwen2.5-0.5B-Instruct \
+ actor_rollout_ref.actor.optim.lr=1e-6 \
+ actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+ actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+ actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+ actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+ actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+ actor_rollout_ref.rollout.n=1 \
+ actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+ critic.optim.lr=1e-5 \
+ critic.model.path=/workspace/verl/models/Qwen2.5-0.5B-Instruct \
+ critic.ppo_micro_batch_size_per_gpu=4 \
+ algorithm.adv_estimator=group_ppo \
+ algorithm.group_params.group_variance_threshold=2.0 \
+ algorithm.group_params.group_max_size=8 \
+ algorithm.group_params.group_epsilon=1e-6 \
+ algorithm.group_params.adaptive_threshold=false \
+ algorithm.kl_ctrl.kl_coef=0.001 \
+ trainer.project_name=group_ppo_qwen_8gpu \
+ trainer.logger=['console'] \
+ trainer.val_before_train=False \
+ trainer.default_hdfs_dir=null \
+ trainer.n_gpus_per_node=8 \
+ trainer.nnodes=1 \
+ trainer.save_freq=100 \
+ trainer.test_freq=100 \
+ trainer.total_epochs=1 2>&1 | tee verl_group_ppo_8gpu.log 
 ```
 
 #### 说明与建议
@@ -89,51 +84,52 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 - 如试跑无OOM，可逐步增大batch和序列长度，建议每次增量不超过50%。
 - 如需针对7B模型或更大batch/序列长度配置，建议先用上述参数试跑，确认稳定后再逐步提升。如有报错或OOM，最好扔给模型分析下参数和原因！
 
-### 其次增大batch，prompt和response
+`tips`
+**需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
+**需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
+**需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
 
+四、Qwen2.5-7B-Instruct 推荐配置
 ```bash
 #!/bin/bash
 
-PROJECT_NAME="group_qwen_3b"
-export WANDB_PROJECT=${PROJECT_NAME}
-
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
-  data.train_files=/workspace/verl_modify/verl/data/gsm8k/train.parquet \
-  data.val_files=/workspace/verl_modify/verl/data/gsm8k/test.parquet \
-  data.train_batch_size=64 \
-  data.max_prompt_length=256 \
-  data.max_response_length=128 \
-  actor_rollout_ref.model.path=/workspace/verl_modify/verl/models/Qwen2.5-3B-Instruct \
-  actor_rollout_ref.actor.optim.lr=1e-6 \
-  actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
-  actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-  actor_rollout_ref.rollout.n=1 \
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
-  critic.optim.lr=1e-5 \
-  critic.model.path=/workspace/verl_modify/verl/models/Qwen2.5-3B-Instruct \
-  critic.ppo_micro_batch_size_per_gpu=2 \
-  algorithm.adv_estimator=group_ppo \
-  algorithm.group_params.group_variance_threshold=0.8 \
-  algorithm.group_params.group_max_size=8 \
-  algorithm.group_params.group_epsilon=1e-6 \
-  algorithm.group_params.adaptive_threshold=false \
-  algorithm.kl_ctrl.kl_coef=0.001 \
-  trainer.project_name=${PROJECT_NAME} \
-  trainer.logger=['wandb'] \
-  trainer.val_before_train=False \
-  trainer.default_hdfs_dir=null \
-  trainer.n_gpus_per_node=8 \
-  trainer.nnodes=1 \
-  trainer.save_freq=1000 \
-  trainer.test_freq=1000 \
-  trainer.total_epochs=3 2>&1 | tee verl_group_demo_3b.log
+ data.train_files=/workspace/verl/data/gsm8k/train.parquet \
+ data.val_files=/workspace/verl/data/gsm8k/test.parquet \
+ data.train_batch_size=64 \
+ data.max_prompt_length=256 \
+ data.max_response_length=128 \
+ actor_rollout_ref.model.path=/workspace/verl/models/Qwen2.5-0.5B-Instruct \
+ actor_rollout_ref.actor.optim.lr=1e-6 \
+ actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+ actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+ actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+ actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+ actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+ actor_rollout_ref.rollout.n=1 \
+ actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+ critic.optim.lr=1e-5 \
+ critic.model.path=/workspace/verl/models/Qwen2.5-0.5B-Instruct \
+ critic.ppo_micro_batch_size_per_gpu=2 \
+ algorithm.adv_estimator=group_ppo \
+ algorithm.group_params.group_variance_threshold=2.0 \
+ algorithm.group_params.group_max_size=8 \
+ algorithm.group_params.group_epsilon=1e-6 \
+ algorithm.group_params.adaptive_threshold=false \
+ algorithm.kl_ctrl.kl_coef=0.001 \
+ trainer.project_name=group_ppo_qwen_8gpu \
+ trainer.logger=['console'] \
+ trainer.val_before_train=False \
+ trainer.default_hdfs_dir=null \
+ trainer.n_gpus_per_node=8 \
+ trainer.nnodes=1 \
+ trainer.save_freq=100 \
+ trainer.test_freq=100 \
+ trainer.total_epochs=1 2>&1 | tee verl_group_ppo_8gpu.log 
 
 
 ```
-#### 使用说明：
-- 直接复制保存为 run_groupppo_3b.sh，运行即可。
-- 如遇OOM，优先减小 data.train_batch_size 或序列长度。
-- 路径、模型名等可根据实际情况调整。
+`tips`
+**需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
+**需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
+**需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
