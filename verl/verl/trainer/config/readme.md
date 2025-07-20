@@ -89,7 +89,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
 **需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
 **需要注意的是：保证ppo_mini_batch_size能被gpu数 × ppo_micro_batch_size_per_gpu整除。**
 
-四、Qwen2.5-7B-Instruct 推荐配置
+## 四、Qwen2.5-7B-Instruct 推荐配置
 ```bash
 #!/bin/bash
 
