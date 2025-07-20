@@ -75,7 +75,7 @@ def compute_group_advantage(
 ```
 
 **含义**：
-- **Algorithm 2 实现**：`_find_group_endpoints` 实现论文中的动态分组算法
+- **Algorithm 2 实现**：`_find_group_endpoints` 实现动态分组算法
 - **稀疏计算**：只在组边界位置计算 advantage，大幅减少计算量
 - **监控机制**：返回详细的性能监控指标
 
@@ -321,7 +321,7 @@ metrics = {
 | **Critic更新** | 每个有效token都计算value loss | 只在每个分组末端token计算value loss |
 | **分组机制** | 无分组，token独立 | response内部动态分组，分组区间隔离 |
 | **训练效率** | 计算量大，全部token都参与 | 端点mask稀疏，Critic大幅降本，训练更高效 |
-| **理论基础** | 标准PPO | 论文Algorithm 2 Group，动态分组与端点机制 |
+| **理论基础** | 标准PPO | Algorithm 2 Group，动态分组与端点机制 |
 
 ---
 
@@ -410,7 +410,7 @@ print("endpoint_mask total sum:", endpoint_mask.sum().item())
 - **分组mask和端点mask精细化**，实现token级分组与端点捕捉
 - **advantage广播与分组严格对应**，分组内一致、分组间隔离
 - **Actor所有token参与更新，Critic只在端点更新**，训练信号充分且高效
-- **与论文Algorithm 2 Group完全一致，理论与工程实现双重对齐**
+- **与Algorithm 2 Group完全一致，理论与工程实现双重对齐**
 
 该实现已完全解决原始GROUP_PPO的分组、端点、广播等关键问题，推荐作为标准实现。
 
