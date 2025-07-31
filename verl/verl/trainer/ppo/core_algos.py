@@ -165,6 +165,9 @@ def compute_gae_advantage_return(
 
         returns = advantages + values
         advantages = verl_F.masked_whiten(advantages, response_mask)
+    
+        # import pdb
+        # pdb.set_trace()
     return advantages, returns
 
 
@@ -547,6 +550,8 @@ def compute_policy_loss(
         # group_endpoints: (batch, seq_len) 0/1 mask, 1表示端点
         effective_mask = response_mask * group_endpoints
     else:
+    # import pdb
+    # pdb.set_trace()
         effective_mask = response_mask
     # ## end新增
 
@@ -555,7 +560,7 @@ def compute_policy_loss(
     # ## 新增: 用effective_mask替换response_mask
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, effective_mask)
     # ## end新增
-
+    # ppo_kl = verl_F.masked_mean(-(log_prob - old_log_prob), response_mask)
     pg_losses1 = -advantages * ratio
     if cliprange_low is None:
         cliprange_low = cliprange
@@ -573,6 +578,8 @@ def compute_policy_loss(
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
     # ## 新增: 用effective_mask替换response_mask
+    # import pdb
+    # pdb.set_trace()
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=effective_mask, loss_agg_mode=loss_agg_mode)
     # ## end新增
 
@@ -628,6 +635,8 @@ def compute_value_loss(vpreds: torch.Tensor, returns: torch.Tensor, values: torc
     clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
     vf_loss = agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
     vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
+    # import pdb
+    # pdb.set_trace()
     return vf_loss, vf_clipfrac
 
 
@@ -823,13 +832,19 @@ def  compute_group_advantage(
                 for seg_idx, endpoint_pos in enumerate(endpoints):
                     if endpoint_pos < response_length and seq_mask[endpoint_pos] > 0:
                         # 分组区间：[last_pos+1, endpoint_pos]
-                        group_mask[global_seq_idx, last_pos+1:endpoint_pos+1] = seg_idx + 1  # 分组ID从1开始
-                        # 计算到端点的累积奖励
+                        start_pos = last_pos + 1
+                        end_pos = endpoint_pos + 1
+                        
+                        group_mask[global_seq_idx, start_pos:end_pos] = seg_idx + 1
+                        
+                        # 修正：只计算当前分组的累积奖励
                         cumulative_reward = torch.sum(
-                            seq_rewards[:endpoint_pos+1] * seq_mask[:endpoint_pos+1]
+                            seq_rewards[start_pos:end_pos] * seq_mask[start_pos:end_pos]
                         )
                         endpoint_value = seq_values[endpoint_pos]
                         advantage = cumulative_reward - endpoint_value
+                        # import pdb
+                        # pdb.set_trace()
                         group_endpoint_advantages.append(advantage)
                         group_endpoint_positions.append((global_seq_idx, endpoint_pos))
                         returns[global_seq_idx, endpoint_pos] = advantage + endpoint_value
@@ -862,10 +877,23 @@ def  compute_group_advantage(
                 group_detail['sequences'].append(seq_detail)
                 global_stats['sequence_details'].append(seq_detail)
             if group_endpoint_advantages:
-                group_avg_advantage = torch.stack(group_endpoint_advantages).mean()
+                # 修正后的advantage广播逻辑
                 for global_seq_idx in group_indices:
                     seq_mask = response_mask[global_seq_idx]
-                    advantages[global_seq_idx] = group_avg_advantage * seq_mask.float()
+                    seq_group_mask = group_mask[global_seq_idx]
+                    
+                    # 初始化该序列的advantage
+                    seq_advantages = torch.zeros_like(seq_mask, dtype=torch.float)
+                    
+                    # 为每个分组分配对应的advantage
+                    for seg_idx, endpoint_advantage in enumerate(group_endpoint_advantages):
+                        group_id = seg_idx + 1
+                        # 找到属于该分组的token位置
+                        group_tokens = (seq_group_mask == group_id) & (seq_mask > 0)
+                        if group_tokens.any():
+                            seq_advantages[group_tokens] = endpoint_advantage
+                    
+                    advantages[global_seq_idx] = seq_advantages
             global_stats['group_details'].append(group_detail)
 
     # 🆕 打印详细统计信息
@@ -875,13 +903,14 @@ def  compute_group_advantage(
     monitoring_metrics = _compute_monitoring_metrics(global_stats, advantages, response_mask)
     
     # 🆕 新增：返回分组mask，用于后续训练
+    
     return advantages, returns, monitoring_metrics, group_mask
 ## v_2 增加监控
 def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, debug_info=None):
     """
-    Algorithm 2: 动态确定分组端点
+    Algorithm 2: 动态确定分组端点 (完全按照论文实现)
     
-    Group:
+    论文中的Algorithm 2 Group:
     - r_ppo ← (1/N) || Σ_{n=1}^t Â_n ⋅ ∇ ln π_θ(s_n) ||^2
     - r_grpo ← (1/N) || Σ_{n=1}^t ∇ ln π_θ(s_n) ||^2 Â_t^2
     - if t ≥ r_grpo / r_ppo then: 重置累积器
@@ -923,7 +952,7 @@ def _find_group_endpoints(mask, old_logprobs, new_logprobs, rewards, values, deb
             cumulative_advantage_grad[t_idx] = current_advantage * policy_grad
             cumulative_grad[t_idx] = policy_grad
         
-        # 公式计算
+        # 论文公式计算
         # r_ppo ← (1/N) || Σ_{n=1}^t Â_n ⋅ ∇ ln π_θ(s_n) ||^2
         r_ppo = (1.0 / N) * (cumulative_advantage_grad[t_idx] ** 2)
         
